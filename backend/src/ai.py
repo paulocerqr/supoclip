@@ -25,6 +25,7 @@ from pydantic_ai.providers.openrouter import OpenRouterProvider
 from pydantic import AliasChoices, BaseModel, Field, field_validator
 
 from .config import Config, get_config
+from .llm_cli import CLI_PROVIDERS, LLMCliError, build_cli_model, cli_config_error
 from .clip_duration import clip_duration
 from .runtime_settings import apply_settings_to_process_env
 
@@ -438,7 +439,7 @@ def build_transcript_system_prompt(clip_length: str = "auto") -> str:
 _transcript_agent: Optional[Agent[None, TranscriptAnalysis]] = None
 _transcript_agent_signature: Optional[tuple[str | None, ...]] = None
 
-SUPPORTED_LLM_PROVIDERS = {"google", "google-gla", "openai", "openrouter", "anthropic", "ollama"}
+SUPPORTED_LLM_PROVIDERS = {"google", "google-gla", "openai", "openrouter", "anthropic", "ollama", *CLI_PROVIDERS}
 
 
 def _split_llm_name(model_name: str) -> tuple[str, str | None]:
@@ -456,7 +457,8 @@ def _get_missing_llm_key_error(model_name: str, runtime_config: Config) -> Optio
     if provider not in SUPPORTED_LLM_PROVIDERS:
         return (
             f"Unsupported LLM provider '{provider}'. "
-            "Use google-gla:*, openai:*, openrouter:*, anthropic:*, or ollama:*."
+            "Use google-gla:*, openai:*, openrouter:*, anthropic:*, ollama:*, "
+            "claude-code:* or codex:*."
         )
 
     if not provider_model_name:
@@ -489,6 +491,10 @@ def _get_missing_llm_key_error(model_name: str, runtime_config: Config) -> Optio
             "Set ANTHROPIC_API_KEY or choose another provider with a matching API key."
         )
 
+    if provider in CLI_PROVIDERS:
+        # Signed-in CLIs bill the subscription; there is no key to check.
+        return cli_config_error(provider)
+
     if provider == "ollama":
         # Ollama can run locally without an API key. OLLAMA_BASE_URL/OLLAMA_API_KEY
         # are optional and passed through as environment variables.
@@ -499,7 +505,7 @@ def _get_missing_llm_key_error(model_name: str, runtime_config: Config) -> Optio
 
 def _uses_native_output(model_name: str) -> bool:
     provider, name = _split_llm_name(model_name)
-    return provider == "openrouter" or (
+    return provider == "openrouter" or provider in CLI_PROVIDERS or (
         provider == "anthropic" and name == "claude-sonnet-5-5"
     )
 
@@ -541,6 +547,8 @@ def _build_transcript_model(
                 "max_tokens": 8192,
             },
         )
+    if provider in CLI_PROVIDERS:
+        return build_cli_model(provider, provider_model_name or "default")
     if provider != "ollama":
         return model_name
 
@@ -1102,6 +1110,8 @@ def _is_transient_model_error(error: Exception) -> bool:
         seen.add(id(current))
         if isinstance(current, ModelHTTPError):
             return current.status_code in TRANSIENT_MODEL_STATUS_CODES
+        if isinstance(current, LLMCliError):
+            return current.transient
         if isinstance(
             current,
             (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError, TimeoutError),

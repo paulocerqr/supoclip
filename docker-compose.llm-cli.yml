@@ -1,0 +1,29 @@
+# Use the host's signed-in Claude Code / Codex CLIs as the LLM
+# (LLM=claude-code:<model> or LLM=codex:<model>). No API key needed: calls
+# bill the subscription each CLI is signed in with.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.llm-cli.yml up -d --build
+#
+# or put COMPOSE_FILE=docker-compose.yml:docker-compose.llm-cli.yml in .env.
+# Sign in on the host first (`claude`, `codex login`). Set LLM_CLI_UID /
+# LLM_CLI_GID if your host user is not 1000 (`id -u`, `id -g`).
+
+x-llm-cli: &llm-cli
+  build:
+    args:
+      INSTALL_LLM_CLIS: "true"
+      LLM_CLI_UID: ${LLM_CLI_UID:-1000}
+      LLM_CLI_GID: ${LLM_CLI_GID:-1000}
+  volumes:
+    - ${HOME}/.claude:/llm-home/.claude
+    - ${HOME}/.codex:/llm-home/.codex
+  environment:
+    - LLM_CLI_HOME=/llm-home
+    - LLM_CLI_USER=llmcli
+    - LLM_CLI_TIMEOUT_SECONDS=${LLM_CLI_TIMEOUT_SECONDS:-600}
+
+services:
+  # The worker runs clip selection, rerank and B-roll planning; the backend
+  # only needs the CLIs for the admin "test LLM" check.
+  worker: *llm-cli
+  backend: *llm-cli

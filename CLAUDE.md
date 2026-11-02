@@ -88,6 +88,7 @@ utils/               → Thread pool helpers for blocking operations (async_help
 3. **AI Analysis** → Pydantic AI selects viral segments (15-60s each) with virality scoring. Transcripts over 15 min are analysed in 12-min windows (2-min overlap, 3 concurrent), deduplicated, then reranked together in one comparative call (`RERANK_LLM`, default `LLM`); final count scales ~1 clip per 5 min, capped by `MAX_CLIPS` (default 10)
 4. **Clip Generation** → MoviePy creates 9:16 clips with:
    - Face-centered cropping: MediaPipe → OpenCV DNN → Haar cascade (fallback chain)
+   - `vertical_streamer` framing: webcam over gameplay, 50/50 (`media/streamer_layout.py`)
    - Word-synced subtitles from AssemblyAI
    - Custom fonts (TTF files in `backend/fonts/`)
    - Optional transition effects (`backend/transitions/`)
@@ -251,6 +252,8 @@ LLM=google-gla:gemini-3-flash-preview # Format: provider:model-name
 GOOGLE_API_KEY=...                   # Or OPENAI_API_KEY / ANTHROPIC_API_KEY
 OLLAMA_BASE_URL=http://localhost:11434/v1  # Optional for ollama:* models
 OLLAMA_API_KEY=...                   # Optional; required for Ollama Cloud
+# LLM=claude-code:sonnet | codex:<model> uses the host's signed-in CLI (no key);
+# Docker needs COMPOSE_FILE=docker-compose.yml:docker-compose.llm-cli.yml (llm_cli.py)
 RERANK_LLM=                          # Optional; model for the long-video candidate rerank (default: LLM)
 YOUTUBE_DOWNLOAD_PROVIDER=yt_dlp     # yt_dlp | apify
 YOUTUBE_PROXY_URL=                   # Optional residential proxy template; empty = off

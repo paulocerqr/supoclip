@@ -68,6 +68,34 @@ In most cases, edit `.env` and then rebuild or restart the stack.
 
 The backend can infer a default LLM from whichever API key is present, but setting `LLM` explicitly is safer and easier to debug.
 
+#### Local CLIs: Claude Code and Codex
+
+`LLM=claude-code:<model>` (for example `claude-code:sonnet`) and
+`LLM=codex:<model>` (for example `codex:gpt-6.1-sol`) send clip selection,
+rerank and B-roll planning through the Claude Code or Codex CLI signed in on
+your machine, billed to that subscription. No API key is needed; `<model>` can
+be `default` for the CLI's default model. Each request is one stateless call
+with the agent's JSON schema (`backend/src/llm_cli.py`). The CLIs run without
+tools, user hooks, plugins or MCP servers, and any `ANTHROPIC_API_KEY` /
+`OPENAI_API_KEY` is hidden from them so they use the subscription login.
+
+With Docker, sign in on the host first (`claude`, `codex login`), then add
+`docker-compose.llm-cli.yml`. It installs both CLIs in the backend and worker
+images and mounts `~/.claude` and `~/.codex`:
+
+```bash
+# .env
+COMPOSE_FILE=docker-compose.yml:docker-compose.llm-cli.yml
+LLM=claude-code:sonnet
+
+docker compose up -d --build
+```
+
+The CLIs run as a container user with your host UID (`LLM_CLI_UID` /
+`LLM_CLI_GID`, default 1000), so token refreshes never leave root-owned files
+in your home directory. `LLM_CLI_TIMEOUT_SECONDS` (default 600) limits each
+call. Studio AI edits and social captions still use `ANTHROPIC_API_KEY`.
+
 ## Core Application Settings
 
 | Variable | Default | Purpose |

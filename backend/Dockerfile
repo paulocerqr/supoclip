@@ -22,6 +22,25 @@ RUN curl -fsSL https://deno.land/install.sh | sh
 ENV DENO_DIR=/root/.deno
 ENV PATH="/root/.deno/bin:${PATH}"
 
+# Optional: Claude Code and Codex CLIs for LLM=claude-code:* / codex:*.
+# docker-compose.llm-cli.yml turns this on and mounts the host's sign-ins.
+# The CLIs run as llmcli, matching the host user that owns ~/.claude and
+# ~/.codex, so refreshed credentials never become root-owned on the host.
+ARG INSTALL_LLM_CLIS=false
+ARG LLM_CLI_UID=1000
+ARG LLM_CLI_GID=1000
+ARG CLAUDE_CODE_VERSION=2.1.316
+ARG CODEX_VERSION=0.166.0
+RUN if [ "$INSTALL_LLM_CLIS" = "true" ]; then \
+      apt-get update && apt-get install -y --no-install-recommends nodejs npm \
+      && rm -rf /var/lib/apt/lists/* \
+      && npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" "@openai/codex@${CODEX_VERSION}" \
+      && npm cache clean --force \
+      && groupadd -o -g "$LLM_CLI_GID" llmcli \
+      && useradd -o -u "$LLM_CLI_UID" -g "$LLM_CLI_GID" -d /llm-home -M -s /usr/sbin/nologin llmcli \
+      && mkdir -p /llm-home && chown llmcli:llmcli /llm-home; \
+    fi
+
 # Install uv package manager
 RUN pip install uv
 
