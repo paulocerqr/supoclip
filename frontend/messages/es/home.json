@@ -66,6 +66,10 @@
       "label": "Pantalla dividida",
       "hint": "Dos hablantes, uno sobre el otro"
     },
+    "vertical_streamer": {
+      "label": "Streamer / webcam",
+      "hint": "Webcam arriba, juego o video abajo"
+    },
     "original": {
       "label": "Original",
       "hint": "Conserva la proporción del video original"

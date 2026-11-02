@@ -66,6 +66,10 @@
       "label": "Split-screen",
       "hint": "Dua pembicara bertumpuk"
     },
+    "vertical_streamer": {
+      "label": "Streamer / webcam",
+      "hint": "Webcam di atas, gameplay atau video di bawah"
+    },
     "original": {
       "label": "Asli",
       "hint": "Pertahankan rasio aspek sumber"

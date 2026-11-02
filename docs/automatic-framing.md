@@ -5,6 +5,15 @@ frame on a blurred 9:16 canvas. `vertical_fit` always preserves the complete
 source on that canvas; it is available in the generation UI, REST settings and
 MCP. `original` still keeps the source aspect ratio.
 
+`vertical_streamer` ("Streamer / webcam") is for streams and reaction videos:
+the creator's webcam fills the top half and the gameplay or video the bottom
+half (`backend/src/media/streamer_layout.py`). Unlike the automatic reaction
+layout it needs no face in the content. The webcam is the small face that stays
+in one place for most of the clip; the overlay rectangle is the persistent edge
+around it, else a head-and-shoulders box. The content crop skips the webcam's
+side column (chat, alerts) when the rest of the frame is wide enough. Captions
+sit on the seam. No webcam face falls back to the `vertical_fit` canvas.
+
 ## Decision policy
 
 The existing sequential decode supplies 480-pixel-wide frames at 3 fps to YuNet

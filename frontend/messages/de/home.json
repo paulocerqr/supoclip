@@ -66,6 +66,10 @@
       "label": "Geteilter Bildschirm",
       "hint": "Zwei Sprecher übereinander"
     },
+    "vertical_streamer": {
+      "label": "Streamer / Webcam",
+      "hint": "Webcam oben, Gameplay oder Video unten"
+    },
     "original": {
       "label": "Original",
       "hint": "Seitenverhältnis der Quelle behalten"

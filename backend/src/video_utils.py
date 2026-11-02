@@ -406,6 +406,12 @@ def create_optimized_clip(
                 except Exception as exc:
                     logger.warning("Vertical layout planning failed: %s", exc)
                     caption_y = None
+            elif reframe_format == "vertical_streamer":
+                from .media.reframing import describe_streamer_layout
+
+                described = describe_streamer_layout(source_clip_path, src_w, src_h)
+                vertical_plan = (described["video_filter"], described["mode"])
+                caption_y = described["caption_y"]
             if layout_report is not None and caption_y is not None:
                 layout_report["caption_y"] = caption_y
 

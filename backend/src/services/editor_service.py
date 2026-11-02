@@ -226,7 +226,7 @@ def generated_emphasis(words: list[dict], task: dict) -> set[int]:
 
 
 # Layouts that are a composed frame, not a crop the editor can rebuild.
-PRESERVED_LAYOUT_KINDS = frozenset({"split", "stack", "reaction", "overlap"})
+PRESERVED_LAYOUT_KINDS = frozenset({"split", "stack", "reaction", "overlap", "streamer"})
 
 
 def editor_preserved_layout(
@@ -242,6 +242,7 @@ def editor_preserved_layout(
     is a plain crop. Those keep the editor's existing vertical or original crop.
     """
     from ..media.reframing import (
+        describe_streamer_layout,
         describe_vertical_layout,
         detect_speaker_reframe_plan,
         ffprobe_video_size,
@@ -257,12 +258,15 @@ def editor_preserved_layout(
                 "output_format": "vertical_split",
                 "speaker_plan": plan,
             }
-        if output_format != "vertical":
+        if output_format not in {"vertical", "vertical_streamer"}:
             return None
         width, height = ffprobe_video_size(clip_path)
-        described = describe_vertical_layout(
-            clip_path, width, height, speaker_turns, speaker_words
-        )
+        if output_format == "vertical_streamer":
+            described = describe_streamer_layout(clip_path, width, height)
+        else:
+            described = describe_vertical_layout(
+                clip_path, width, height, speaker_turns, speaker_words
+            )
     except Exception:
         logging.getLogger(__name__).warning(
             "Could not read an editor reframing plan", exc_info=True
@@ -274,7 +278,7 @@ def editor_preserved_layout(
     return {
         "kind": described["kind"],
         "landscape_recommended": described["kind"] in {"fit", "compositor"},
-        "output_format": "vertical",
+        "output_format": output_format,
         "vertical_plan": (described["video_filter"], described["mode"]),
     }
 
@@ -587,7 +591,7 @@ async def prepare_editor(ctx, task_id: str, clip_id: str, filename: str):
             # vertical or original crop. Bake that frame into the editor
             # source so preview and export show it. Other clips keep this
             # uncropped trim and the crop chosen below.
-            if output_format in {"vertical", "vertical_split"}:
+            if output_format in {"vertical", "vertical_split", "vertical_streamer"}:
                 await run_in_thread(
                     bake_editor_layout, clean, output_format, source, local_ranges, True
                 )

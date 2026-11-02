@@ -1457,6 +1457,35 @@ def build_vertical_filter_plan(
     return described["video_filter"], described["mode"], described["caption_y"]
 
 
+def describe_streamer_layout(input_path: Path, width: int, height: int) -> Dict[str, Any]:
+    """Webcam over content for the explicit streamer framing.
+
+    One face pass at 1 fps is enough: the webcam does not move. Without a
+    webcam face the clip keeps everything visible with the full-frame fit.
+    """
+    from .streamer_layout import choose_streamer_layout
+
+    layout = None
+    try:
+        duration = ffprobe_duration(input_path)
+        samples = analyze_vertical_clip(
+            input_path, sample_fps=1.0, proc_width=960, analyze_context=False
+        )[2]
+        layout = choose_streamer_layout(input_path, width, height, duration, samples)
+    except Exception as exc:
+        logger.warning("Streamer layout analysis failed (%s); using the full-frame fit", exc)
+    if layout:
+        logger.info(
+            "Streamer layout: webcam face %s, webcam box %s (overlay edge found: %s)",
+            tuple(round(v) for v in layout["face"]),
+            tuple(round(v) for v in layout["webcam"]),
+            layout["edge_found"],
+        )
+        return _described("streamer", layout["video_filter"], "complex", layout["caption_y"])
+    logger.info("Streamer framing found no webcam face; using the full-frame fit")
+    return _described("fit", build_full_frame_filter(), "complex", 0.80)
+
+
 def describe_vertical_layout(
     input_path: Path,
     width: int,
@@ -1823,6 +1852,9 @@ def render_reframed_clip_ffmpeg(
         video_filter, mode = build_full_frame_filter(), "complex"
     elif vertical_plan is not None:
         video_filter, mode = vertical_plan
+    elif output_format == "vertical_streamer":
+        described = describe_streamer_layout(input_path, width, height)
+        video_filter, mode = described["video_filter"], described["mode"]
     else:
         video_filter, mode, _caption_y = build_vertical_filter_plan(
             input_path, width, height, speaker_turns, speaker_words
@@ -1876,5 +1908,8 @@ def caption_probe_plan(input_path: Path, output_format: str, vertical_plan=None)
     if vertical_plan is not None:
         return vertical_plan
     width, height = ffprobe_video_size(input_path)
+    if output_format == "vertical_streamer":
+        described = describe_streamer_layout(input_path, width, height)
+        return described["video_filter"], described["mode"]
     video_filter, mode, _ = build_vertical_filter_plan(input_path, width, height)
     return video_filter, mode
