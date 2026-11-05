@@ -11,8 +11,10 @@ from __future__ import annotations
 import logging
 import math
 import re
+import secrets
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from contextlib import contextmanager
@@ -38,6 +40,71 @@ _ATTEMPT_LOG_KEYS = (
 
 class YouTubeDownloadError(RuntimeError):
     """A YouTube download attempt failed."""
+
+
+class YouTubeGeoRestrictedError(YouTubeDownloadError):
+    """The source has region restrictions and download recovery did not succeed."""
+
+    def __init__(self):
+        super().__init__(
+            "This YouTube video has regional restrictions, and we could not download it. "
+            "Upload the video file or choose a different source."
+        )
+
+
+def _exception_chain(exc: BaseException):
+    """yt-dlp also retains its extractor error in DownloadError.exc_info."""
+    pending = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if not isinstance(current, BaseException) or id(current) in seen:
+            continue
+        seen.add(id(current))
+        yield current
+        # Implicit exception context may describe a prior provider's failure,
+        # rather than the reason this operation failed.
+        pending.append(current.__cause__)
+        exc_info = getattr(current, "exc_info", None)
+        if isinstance(exc_info, tuple) and len(exc_info) > 1:
+            pending.append(exc_info[1])
+
+
+def is_geo_restricted_error(exc: BaseException) -> bool:
+    from yt_dlp.utils import GeoRestrictedError
+
+    for error in _exception_chain(exc):
+        if isinstance(error, (GeoRestrictedError, YouTubeGeoRestrictedError)):
+            return True
+        message = str(error).lower()
+        if any(marker in message for marker in (
+            "not made this video available in your country",
+            "not available in your country",
+            "not available from your location",
+            "this youtube video has regional restrictions",
+        )):
+            return True
+    return False
+
+
+def _allowed_geo_countries(exc: BaseException) -> list[str]:
+    """Use structured extractor evidence, never guess from a generic 403."""
+    from yt_dlp.utils import GeoRestrictedError, ISO3166Utils
+
+    countries = set()
+    for error in _exception_chain(exc):
+        if not isinstance(error, GeoRestrictedError):
+            continue
+        values = error.countries
+        if not isinstance(values, (list, tuple, set)):
+            continue
+        for value in values:
+            if isinstance(value, str) and re.fullmatch(r"[A-Za-z]{2}", value):
+                if ISO3166Utils.short2full(value.upper()):
+                    countries.add(value.lower())
+    # Prefer widely available proxy exits when the source explicitly permits them.
+    preferred = [country for country in ("us", "ca", "gb") if country in countries]
+    return preferred + sorted(countries.difference(preferred))
 
 
 class DownloadBudgetExceeded(YouTubeDownloadError):
@@ -94,6 +161,8 @@ class ByteBudget:
         self.limit = max(0, int(limit))
         self.total = 0
         self._lock = threading.Lock()
+        # Recovery belongs to this job, never to the process-wide configuration.
+        self._proxy_routes: dict[tuple[Optional[str], str], tuple[str, str]] = {}
 
     def add(self, nbytes: int) -> None:
         if nbytes <= 0:
@@ -109,6 +178,15 @@ class ByteBudget:
     def snapshot(self) -> int:
         with self._lock:
             return self.total
+
+    def proxy_route(self, task_id: Optional[str], video_id: str) -> Optional[tuple[str, str]]:
+        with self._lock:
+            return self._proxy_routes.get((task_id, video_id))
+
+    def remember_proxy_route(self, task_id: Optional[str], video_id: str,
+                             country: str, session: str) -> None:
+        with self._lock:
+            self._proxy_routes[(task_id, video_id)] = (country, session)
 
 
 def proxy_configured(config=None) -> bool:
@@ -253,15 +331,19 @@ def log_youtube_attempt(
     logger.info(message, *args, extra=extra)
 
 
-def base_proxy_params(task_id: Optional[str] = None, video_id: Optional[str] = None, config=None) -> dict[str, Any]:
+def base_proxy_params(task_id: Optional[str] = None, video_id: Optional[str] = None, config=None,
+                      *, session_id: Optional[str] = None,
+                      country: Optional[str] = None) -> dict[str, Any]:
     """yt-dlp params that send metadata and media through the proxy.
 
     Player clients are left at yt-dlp defaults. PO tokens are requested only
     when a bgutil HTTP provider URL is configured.
     """
     runtime = config or get_config()
-    session = sticky_session_id(task_id, video_id)
-    country = normalize_country(getattr(runtime, "youtube_proxy_country", ""))
+    session = session_id or sticky_session_id(task_id, video_id)
+    country = normalize_country(
+        getattr(runtime, "youtube_proxy_country", "") if country is None else country
+    )
     params: dict[str, Any] = {
         "proxy": render_proxy_url(runtime.youtube_proxy_url, session, country),
         # yt-dlp treats 0.0.0.0 as "force IPv4" (the -4 flag).
@@ -302,8 +384,8 @@ def _progress_hook(budget: ByteBudget, seen: dict[str, int]) -> Callable[[dict],
         downloaded = int(status.get("downloaded_bytes") or status.get("total_bytes") or 0)
         previous = seen.get(filename, 0)
         if downloaded > previous:
-            budget.add(downloaded - previous)
             seen[filename] = downloaded
+            budget.add(downloaded - previous)
 
     return hook
 
@@ -314,22 +396,119 @@ def download_options(
     budget: ByteBudget,
     *,
     seen: Optional[dict[str, int]] = None,
+    session_id: Optional[str] = None,
+    country: Optional[str] = None,
 ) -> dict[str, Any]:
     """Options for a native yt-dlp download. Never sets ``download_ranges``."""
-    options = base_proxy_params(task_id, video_id)
+    options = base_proxy_params(task_id, video_id, session_id=session_id, country=country)
     options["_youtube_deadline"] = time.monotonic() + max(
         30, getattr(get_config(), "youtube_proxy_timeout_seconds", 300)
     )
-    count_bytes = _progress_hook(budget, seen if seen is not None else {})
+    observed = seen if seen is not None else {}
+    count_bytes = _progress_hook(budget, observed)
+    options["_youtube_count_bytes"] = count_bytes
+    options["_youtube_seen_bytes"] = observed
 
     def bounded_progress(status):
-        _check_deadline(options)
         count_bytes(status)
+        _check_deadline(options)
 
     options["progress_hooks"] = [bounded_progress]
     # Guard: section cuts must not be delegated to ffmpeg's protocol handler.
     options.pop("download_ranges", None)
     return options
+
+
+def is_transient_proxy_error(exc: BaseException) -> bool:
+    """Only transport failures merit a new residential session, never bad media."""
+    transient = False
+    for error in _exception_chain(exc):
+        if isinstance(error, (DownloadBudgetExceeded, PartialDownloadUnavailable)):
+            return False
+        if isinstance(error, (DownloadDeadlineExceeded, TimeoutError, ConnectionError)):
+            transient = True
+        message = str(error).lower()
+        if any(marker in message for marker in (
+            "unable to connect to proxy", "tunnel connection failed", "no_host_connection",
+            "no_ray", "timed out", "connection reset", "connection aborted",
+            "remote end closed", "http error 502", "http error 503", "http error 504",
+        )):
+            transient = True
+        # yt-dlp's IncompleteRead is often wrapped in a DownloadError. A peer
+        # closing a response early is recoverable just like a connection reset.
+        if re.search(r"\b\d+ bytes read, \d+ more expected\b", message):
+            transient = True
+    return transient
+
+
+def _with_proxy_retry(operation: Callable, *, task_id: Optional[str], video_id: str,
+                      budget: ByteBudget, cleanup: Callable[[], None],
+                      deadline: Optional[float] = None):
+    """One transport and one region retry stay inside the initial budget plus 60s.
+
+    Each attempt re-extracts metadata, keeping signed URLs and all fragments on
+    that attempt's session. Completed sections outside this operation are kept.
+    """
+    runtime = get_config()
+    initial_seconds = max(30, getattr(runtime, "youtube_proxy_timeout_seconds", 300))
+    overall_deadline = time.monotonic() + initial_seconds + 60
+    if deadline is not None:
+        overall_deadline = min(overall_deadline, deadline)
+    route = budget.proxy_route(task_id, video_id)
+    country = route[0] if route else normalize_country(getattr(runtime, "youtube_proxy_country", ""))
+    session = route[1] if route else sticky_session_id(task_id, video_id)
+    geo_retry = False
+    transport_retry = False
+    retry_deadline = None
+    for attempt in range(3):
+        options = download_options(
+            task_id, video_id, budget,
+            session_id=session, country=country,
+        )
+        options["_youtube_deadline"] = min(
+            overall_deadline, retry_deadline if attempt else time.monotonic() + initial_seconds
+        )
+        options["_youtube_metadata_ready"] = lambda country=country, session=session: (
+            budget.remember_proxy_route(task_id, video_id, country, session)
+        )
+        try:
+            _check_deadline(options)
+            result = operation(options)
+            budget.remember_proxy_route(task_id, video_id, country, session)
+            return result
+        except Exception as exc:
+            cleanup()
+            if isinstance(exc, DownloadBudgetExceeded):
+                raise
+            is_geo = is_geo_restricted_error(exc)
+            now = time.monotonic()
+            allowed = [value for value in _allowed_geo_countries(exc) if value != country] if is_geo else []
+            can_switch_region = (
+                is_geo and not geo_retry and allowed
+                and "{country}" in (runtime.youtube_proxy_url or "")
+            )
+            if now < overall_deadline and can_switch_region:
+                country = allowed[0]
+                geo_retry = True
+                # Region errors normally happen before transfer. Preserve the
+                # unused initial allowance for downloading from the working exit.
+                retry_deadline = overall_deadline
+                logger.info(
+                    "youtube_proxy_region_retry country=%s video_id=%s task_id=%s",
+                    country, video_id, task_id or "-",
+                )
+            elif now < overall_deadline and not is_geo and not transport_retry and is_transient_proxy_error(exc):
+                transport_retry = True
+                retry_deadline = min(overall_deadline, now + 60)
+            else:
+                if is_geo:
+                    raise YouTubeGeoRestrictedError() from exc
+                raise
+            session = secrets.token_hex(12)
+            logger.info(
+                "youtube_proxy_retry attempt=%s video_id=%s task_id=%s error=%s",
+                attempt + 2, video_id, task_id or "-", public_download_error(exc),
+            )
 
 
 def _is_video_format(fmt: dict) -> bool:
@@ -942,7 +1121,7 @@ def native_download_format(
         "acodec": fmt.get("acodec"),
         "width": fmt.get("width"),
         "height": fmt.get("height"),
-        "downloader_options": fmt.get("downloader_options"),
+        "downloader_options": fmt.get("downloader_options") or {},
         "fragment_base_url": fmt.get("fragment_base_url"),
         "extra_param_to_segment_url": fmt.get("extra_param_to_segment_url"),
     }
@@ -957,14 +1136,27 @@ def native_download_format(
     # Section metadata would make yt-dlp pick FFmpegFD and bypass the proxy.
     info.pop("section_start", None)
     info.pop("section_end", None)
-    with _proxy_client(params) as ydl:
-        ydl.process_info(info)
+    try:
+        with _proxy_client(params) as ydl:
+            ydl.process_info(info)
+    except Exception as exc:
+        _account_failed_media(
+            options, dest_stem, exc, extensions={"." + info["ext"]},
+            include_incomplete=fragments is None,
+            incomplete_filename=str(dest_stem) + "." + info["ext"],
+        )
+        raise
     return _find_download(dest_stem)
 
 
-def extract_video_info(url: str, options: dict[str, Any]) -> dict:
-    import yt_dlp
+def _metadata_ready(options: dict[str, Any]) -> None:
+    """Keep a proven route even if format selection or media transfer later fails."""
+    callback = options.get("_youtube_metadata_ready")
+    if callback:
+        callback()
 
+
+def extract_video_info(url: str, options: dict[str, Any]) -> dict:
     params = dict(options)
     params.pop("download_ranges", None)
     params.update({"skip_download": True, "quiet": True, "noplaylist": True})
@@ -972,7 +1164,25 @@ def extract_video_info(url: str, options: dict[str, Any]) -> dict:
         info = ydl.extract_info(url, download=False)
     if not isinstance(info, dict):
         raise YouTubeDownloadError("yt-dlp returned no video info")
+    _metadata_ready(options)
     return info
+
+
+def extract_video_info_with_proxy(
+    url: str,
+    video_id: str,
+    *,
+    task_id: Optional[str] = None,
+    budget: Optional[ByteBudget] = None,
+    deadline: Optional[float] = None,
+) -> dict:
+    """Metadata preflight gets the same bounded region recovery as media."""
+    return _with_proxy_retry(
+        lambda options: extract_video_info(url, options),
+        task_id=task_id, video_id=video_id,
+        budget=budget or ByteBudget(get_config().youtube_download_max_bytes),
+        cleanup=lambda: None, deadline=deadline,
+    )
 
 
 def _account_file(path: Path, budget: ByteBudget, seen_before: int) -> int:
@@ -990,6 +1200,25 @@ def download_audio(
     task_id: Optional[str] = None,
     budget: Optional[ByteBudget] = None,
 ) -> Path:
+    counter = budget or ByteBudget(get_config().youtube_download_max_bytes)
+    return _with_proxy_retry(
+        lambda options: _download_audio_attempt(
+            url, video_id, dest_stem, task_id=task_id, budget=counter, options=options,
+        ),
+        task_id=task_id, video_id=video_id, budget=counter,
+        cleanup=lambda: _discard_output(dest_stem),
+    )
+
+
+def _download_audio_attempt(
+    url: str,
+    video_id: str,
+    dest_stem: Path,
+    *,
+    task_id: Optional[str],
+    budget: ByteBudget,
+    options: dict[str, Any],
+) -> Path:
     """Download modest full-duration audio. ``dest_stem`` has no suffix.
 
     The first attempt is unchanged: the modest https/m4a format (typically
@@ -998,10 +1227,7 @@ def download_audio(
     that same info response. The format dict is passed to ``process_info``
     so ffmpeg is not asked to fetch a remote playlist.
     """
-    runtime = get_config()
-    counter = budget or ByteBudget(runtime.youtube_download_max_bytes)
-    seen: dict[str, int] = {}
-    options = download_options(task_id, video_id, counter, seen=seen)
+    counter = budget
     started = counter.snapshot()
     logged_failure = False
     hls_retry = False
@@ -1099,14 +1325,34 @@ def download_section_file(
     budget: Optional[ByteBudget] = None,
     fallback: Optional[str] = None,
 ) -> tuple[Path, float, float]:
+    counter = budget or ByteBudget(get_config().youtube_download_max_bytes)
+    return _with_proxy_retry(
+        lambda options: _download_section_attempt(
+            url, video_id, start, end, dest, task_id=task_id, budget=counter,
+            fallback=fallback, options=options,
+        ),
+        task_id=task_id, video_id=video_id, budget=counter,
+        cleanup=lambda: dest.unlink(missing_ok=True),
+    )
+
+
+def _download_section_attempt(
+    url: str,
+    video_id: str,
+    start: float,
+    end: float,
+    dest: Path,
+    *,
+    task_id: Optional[str],
+    budget: ByteBudget,
+    fallback: Optional[str],
+    options: dict[str, Any],
+) -> tuple[Path, float, float]:
     """Download one time window. Returns the file and its original-timeline bounds.
 
     Media bytes go through yt-dlp. ffmpeg only trims and muxes local files.
     """
-    runtime = get_config()
-    counter = budget or ByteBudget(runtime.youtube_download_max_bytes)
-    seen: dict[str, int] = {}
-    options = download_options(task_id, video_id, counter, seen=seen)
+    counter = budget
     before = counter.snapshot()
     work = dest.parent / f".parts-{dest.stem}"
     try:
@@ -1185,6 +1431,55 @@ def download_section_file(
         shutil.rmtree(work, ignore_errors=True)
 
 
+def _account_failed_media(
+    options: dict[str, Any],
+    stem: Path,
+    exc: BaseException,
+    *,
+    extensions: Optional[set[str]] = None,
+    include_incomplete: bool = True,
+    incomplete_filename: Optional[str] = None,
+) -> None:
+    """Charge an attempt's bytes missed between socket reads and progress hooks.
+
+    ``stem`` must belong to this attempt. Local merged output contains already
+    charged component bytes and is excluded even if yt-dlp removed those inputs.
+    """
+    count_bytes = options.get("_youtube_count_bytes")
+    if count_bytes is None:
+        return
+    extensions = extensions or {".mp4", ".m4a", ".webm", ".mkv", ".opus", ".ogg", ".mp3"}
+    seen = options.get("_youtube_seen_bytes", {})
+    component_prefix = str(stem) + ".f"
+    media = [
+        path for path in stem.parent.glob(stem.name + ".*")
+        if path.is_file() and Path(str(path).removesuffix(".part")).suffix.lower() in extensions
+    ]
+    has_components = any(name.startswith(component_prefix) for name in seen) or any(
+        str(path).startswith(component_prefix) for path in media
+    )
+    if has_components:
+        media = [path for path in media if str(path).startswith(component_prefix)]
+    incomplete = re.search(r"\b(\d+) bytes read, \d+ more expected\b", str(exc)) if include_incomplete else None
+    for path in media:
+        count_bytes({
+            "status": "downloading", "filename": str(path).removesuffix(".part"),
+            "downloaded_bytes": path.stat().st_size,
+        })
+    if incomplete:
+        # A complete video can remain while the next audio response fails before
+        # its first write. Only an explicit name or a unique partial identifies
+        # that response; a sole completed file is not evidence of ownership.
+        partials = [path for path in media if path.suffix == ".part"]
+        filename = incomplete_filename
+        if filename is None and len(partials) == 1:
+            filename = str(partials[0]).removesuffix(".part")
+        if filename is None:
+            filename = str(stem) + ".incomplete"
+        count_bytes({"status": "downloading", "filename": filename,
+                     "downloaded_bytes": int(incomplete.group(1))})
+
+
 def download_full_with_proxy(
     url: str,
     video_id: str,
@@ -1194,32 +1489,53 @@ def download_full_with_proxy(
     budget: Optional[ByteBudget] = None,
     quality: Optional[str] = None,
 ) -> Path:
-    """Full-file fallback through the proxy, capped at 1080p, native downloader."""
-    import yt_dlp
-
+    """Download into owned staging paths, preserving shared media and sidecars."""
     runtime = get_config()
     counter = budget or ByteBudget(runtime.youtube_download_max_bytes)
-    seen: dict[str, int] = {}
-    before = counter.snapshot()
     dest_dir.mkdir(parents=True, exist_ok=True)
-    options = download_options(task_id, video_id, counter, seen=seen)
-    options.update({
-        "format": video_format_selector(int(quality) if quality else None),
-        "merge_output_format": "mp4",
-        "outtmpl": str(dest_dir / f"{video_id}.%(ext)s"),
-    })
-    options.pop("download_ranges", None)
+    job_dir = Path(tempfile.mkdtemp(prefix=f"proxy-{video_id}-", dir=dest_dir))
+
+    def download(options):
+        before = counter.snapshot()
+        with tempfile.TemporaryDirectory(prefix="attempt-", dir=job_dir) as directory:
+            stem = Path(directory) / video_id
+
+            def metadata_available(_info, *, incomplete=False):
+                if not incomplete:
+                    _metadata_ready(options)
+                return None
+
+            options.update({
+                "format": video_format_selector(int(quality) if quality else None),
+                "merge_output_format": "mp4",
+                "outtmpl": str(stem) + ".%(ext)s",
+                "match_filter": metadata_available,
+            })
+            try:
+                with _proxy_client(options) as ydl:
+                    ydl.download([url])
+            except Exception as exc:
+                _account_failed_media(options, stem, exc)
+                raise
+            path = _find_download(stem)
+            _account_file(path, counter, before)
+            result = job_dir / (video_id + path.suffix)
+            path.replace(result)
+            return result
+
     try:
-        with _proxy_client(options) as ydl:
-            ydl.download([url])
-        path = _find_download(dest_dir / video_id)
-        _account_file(path, counter, before)
-        return path
-    except Exception:
-        partials = list(dest_dir.glob(f"{video_id}.*"))
-        for partial in partials:
-            if partial.suffix.lower() in {".part", ".ytdl"}:
-                partial.unlink(missing_ok=True)
+        result = _with_proxy_retry(
+            download, task_id=task_id, video_id=video_id, budget=counter,
+            cleanup=lambda: None,  # Each operation owns a TemporaryDirectory.
+        )
+        # Uncached-source deployments keep their transcript beside the old
+        # shared download. A unique download still reuses those word timings.
+        from .youtube_source import copy_transcript_sidecar
+
+        copy_transcript_sidecar(dest_dir / f"{video_id}.mp4", result)
+        return result
+    except BaseException:
+        shutil.rmtree(job_dir, ignore_errors=True)
         raise
 
 

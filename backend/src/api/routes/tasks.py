@@ -39,6 +39,7 @@ from ...workers.job_queue import JobQueue
 from ...workers.progress import ProgressTracker
 from ...config import get_config
 from ...youtube_utils import async_get_youtube_video_info, canonical_youtube_url
+from ...youtube_proxy import YouTubeGeoRestrictedError
 from ...stream_source import (
     PREFLIGHT_DEADLINE_SECONDS as STREAM_PREFLIGHT_DEADLINE_SECONDS,
     StreamSourceError,
@@ -68,7 +69,7 @@ async def _preflight_youtube_source(url: str, duration_limit: int) -> Dict[str, 
     timeout_seconds = get_config().youtube_preflight_timeout_seconds
     try:
         metadata = await asyncio.wait_for(
-            async_get_youtube_video_info(url),
+            async_get_youtube_video_info(url, deadline=time.monotonic() + timeout_seconds),
             timeout=timeout_seconds,
         )
         duration = (metadata or {}).get("duration")
@@ -76,6 +77,14 @@ async def _preflight_youtube_source(url: str, duration_limit: int) -> Dict[str, 
             raise ValueError("Missing video duration")
         if not math.isfinite(duration) or duration <= 0:
             raise ValueError("Invalid video duration")
+    except YouTubeGeoRestrictedError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "YOUTUBE_GEO_RESTRICTED",
+                "message": f"{exc} No minutes were used.",
+            },
+        ) from None
     except TimeoutError:
         logger.warning(
             "YouTube metadata preflight timed out after %s seconds",
@@ -1227,6 +1236,11 @@ async def update_clip_captions(
             position_y=position_y,
         )
         return {"clip": updated_clip}
+    except YouTubeGeoRestrictedError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "YOUTUBE_GEO_RESTRICTED", "message": str(exc)},
+        ) from None
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except HTTPException:
@@ -1331,6 +1345,11 @@ async def apply_task_settings(
             db=db,
         )
         return {"task": task, "message": "Task settings updated"}
+    except YouTubeGeoRestrictedError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "YOUTUBE_GEO_RESTRICTED", "message": str(exc)},
+        ) from None
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except HTTPException:
@@ -1454,7 +1473,7 @@ async def get_performance_metrics(
 async def resume_task(
     task_id: str, request: Request, db: AsyncSession = Depends(get_db)
 ):
-    """Resume a cancelled or errored task by enqueueing a new worker job."""
+    """Retry a cancelled or errored task while preserving completed clips."""
     try:
         task_service = TaskService(db)
         task = await _require_task_owner(request, task_service, db, task_id)
@@ -1466,7 +1485,7 @@ async def resume_task(
             if task.get("status") not in ["cancelled", "error"]:
                 raise HTTPException(
                     status_code=400,
-                    detail="Only cancelled/error/queued tasks can be resumed",
+                    detail="Only cancelled/error/queued tasks can be retried",
                 )
 
             source_url = task.get("source_url")
@@ -1549,12 +1568,12 @@ async def resume_task(
                 except Exception:
                     await task_service.task_repo.update_task_status(
                         db, task_id, task["status"],
-                        progress_message="Could not enqueue resume. Please retry.",
+                        progress_message="Could not queue generation. Please try again.",
                         expected_statuses=["queued", task["status"]],
                     )
                     raise
 
-                return {"message": "Task resumed", "job_id": job_id}
+                return {"message": "Generation retry queued", "job_id": job_id}
     except GenerationAllowanceBusy as e:
         raise HTTPException(status_code=409, detail=str(e), headers={"Retry-After": "1"})
     except BillingLimitExceeded as e:
@@ -1571,8 +1590,8 @@ async def resume_task(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error resuming task: {e}")
-        raise HTTPException(status_code=500, detail=f"Error resuming task: {str(e)}")
+        logger.error(f"Error retrying generation: {e}")
+        raise HTTPException(status_code=500, detail=f"Error retrying generation: {str(e)}")
 
 
 @router.get("/dead-letter/list")

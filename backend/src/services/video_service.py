@@ -23,6 +23,7 @@ from ..youtube_proxy import (
     ByteBudget,
     DownloadBudgetExceeded,
     PartialDownloadUnavailable,
+    YouTubeGeoRestrictedError,
     proxy_configured,
     public_download_error,
 )
@@ -35,6 +36,7 @@ from ..youtube_source import (
     load_time_map,
     local_ranges_for,
     persist_cache_sidecar,
+    preserve_geo_restriction,
 )
 from ..video_utils import (
     get_video_transcript,
@@ -461,6 +463,7 @@ class VideoService:
                 return None
             job_budget = budget or ByteBudget(get_config().youtube_download_max_bytes)
             bypass_proxy = skip_proxy
+            section_error = None
             if ranges:
                 try:
                     segments = [
@@ -478,6 +481,7 @@ class VideoService:
                 except DownloadBudgetExceeded:
                     raise
                 except Exception as exc:
+                    section_error = exc
                     # Only unsupported slicing warrants a full proxy attempt.
                     bypass_proxy = skip_proxy or not isinstance(exc, PartialDownloadUnavailable)
                     if errors is not None and not isinstance(exc, PartialDownloadUnavailable):
@@ -487,7 +491,7 @@ class VideoService:
                         video_id,
                         exc,
                     )
-            return resolve_full_youtube_download(
+            path = resolve_full_youtube_download(
                 url,
                 video_id,
                 lambda **kwargs: download_youtube_video(
@@ -498,6 +502,7 @@ class VideoService:
                 skip_proxy=bypass_proxy,
                 quality=quality,
             )
+            return preserve_geo_restriction(path, section_error)
 
         try:
             video_path = await run_in_thread(_resolve)
@@ -912,6 +917,8 @@ class VideoService:
         should_cancel: Optional[Callable[[], Awaitable[bool]]] = None,
         performance_context: Optional[str] = None,
         clip_length: str = "auto",
+        checkpoint: Optional[Dict[str, Any]] = None,
+        checkpoint_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
     ) -> Dict[str, Any]:
         """
         Complete video processing pipeline.
@@ -922,6 +929,13 @@ class VideoService:
         """
         video_path: Optional[Path] = None
         audio_first = False
+        checkpoint = dict(checkpoint or {})
+
+        async def save_checkpoint(patch: Dict[str, Any]) -> None:
+            if checkpoint_callback:
+                await checkpoint_callback(patch)
+            checkpoint.update(patch)
+
         try:
             runtime_config = get_config()
             duration_limit = (
@@ -937,7 +951,23 @@ class VideoService:
                 await progress_callback(10, "Downloading video...", "processing")
 
             if source_type == "youtube":
-                video_info = await async_get_youtube_video_info(url, task_id=task_id)
+                job_budget = ByteBudget(
+                    getattr(runtime_config, "youtube_download_max_bytes", 2_000_000_000)
+                )
+                metadata_error = None
+                try:
+                    video_info = await async_get_youtube_video_info(
+                        url, task_id=task_id, budget=job_budget,
+                    )
+                except YouTubeGeoRestrictedError as exc:
+                    # A retry already passed admission. Metadata failure must
+                    # not prevent reuse of saved media or independent providers.
+                    metadata_error = exc
+                    video_info = None
+                    logger.warning("YouTube metadata unavailable; trying saved media and download providers: %s", exc)
+                except TimeoutError:
+                    video_info = None
+                    logger.warning("YouTube metadata timed out; trying saved media and download providers")
                 source_duration = None
                 if video_info:
                     duration = video_info.get("duration", 0)
@@ -950,9 +980,6 @@ class VideoService:
                         )
 
                 video_id = get_youtube_video_id(url)
-                job_budget = ByteBudget(
-                    getattr(runtime_config, "youtube_download_max_bytes", 2_000_000_000)
-                )
                 cached_full = (
                     await run_in_thread(cached_full_media, video_id, download_quality)
                     if video_id else None
@@ -992,6 +1019,7 @@ class VideoService:
                     video_path = cached_full or await VideoService.download_video(
                         url, task_id=task_id, quality=download_quality, budget=job_budget,
                     )
+                video_path = preserve_geo_restriction(video_path, metadata_error)
                 if not video_path:
                     raise Exception("Failed to download video")
             elif source_type in {"twitch", "kick"}:
@@ -1051,7 +1079,18 @@ class VideoService:
             if progress_callback:
                 await progress_callback(30, "Generating transcript...", "processing")
 
-            transcript = cached_transcript
+            transcript = checkpoint.get("transcript") or cached_transcript
+            transcript_data = checkpoint.get("transcript_data")
+            if transcript and isinstance(transcript_data, dict) and transcript_data.get("words"):
+                # The source cache may have expired or moved to another worker.
+                # Restore the original-source timings, not a stitched timeline.
+                sidecar = video_path.with_suffix(".transcript_cache.json")
+                temporary = sidecar.with_name(f".{sidecar.name}.{uuid.uuid4().hex}.tmp")
+                try:
+                    await run_in_thread(temporary.write_text, json.dumps(transcript_data))
+                    await run_in_thread(temporary.replace, sidecar)
+                finally:
+                    temporary.unlink(missing_ok=True)
             # Database text alone cannot recreate timed captions or cleanup.
             # Repair older caches whose word-timing sidecar was removed.
             needs_word_timings = (
@@ -1065,6 +1104,17 @@ class VideoService:
                     processing_mode=processing_mode,
                     source_url=url if source_type == "youtube" else None,
                 )
+                if checkpoint.get("analysis"):
+                    # Never combine new word timings with an old clip plan.
+                    await save_checkpoint({"analysis": None, "candidates": None, "segments": None})
+                    cached_analysis_json = None
+
+            # Commit paid work before any subsequent storage, analysis or download
+            # can fail. The DB copy also repairs an absent word-timing sidecar.
+            await save_checkpoint({
+                "transcript": transcript,
+                "transcript_data": await run_in_thread(load_cached_transcript_data, video_path),
+            })
 
             # Preserve paid word timings before any analysis/cancellation path.
             try:
@@ -1083,11 +1133,13 @@ class VideoService:
                 )
 
             relevant_parts = None
+            if checkpoint.get("analysis"):
+                cached_analysis_json = json.dumps(checkpoint["analysis"])
             if cached_analysis_json:
                 try:
                     cached_analysis = json.loads(cached_analysis_json)
                     segments = cached_analysis.get("most_relevant_segments", [])
-                    if not segments:
+                    if not segments and not (checkpoint.get("candidates") or checkpoint.get("segments")):
                         logger.info(
                             "Ignoring cached transcript analysis with no clip segments"
                         )
@@ -1128,17 +1180,25 @@ class VideoService:
                     clip_length=clip_length,
                 )
 
+            await save_checkpoint({"analysis": {
+                "summary": relevant_parts.summary,
+                "key_topics": relevant_parts.key_topics,
+                "most_relevant_segments": [
+                    segment if isinstance(segment, dict) else segment.model_dump()
+                    for segment in relevant_parts.most_relevant_segments
+                ],
+            }})
+
             # Step 4: Create clips
             if should_cancel and await should_cancel():
                 raise Exception("Task cancelled")
 
-            if progress_callback:
-                await progress_callback(70, "Creating video clips...", "processing")
-
             raw_segments = relevant_parts.most_relevant_segments
-            segments_json: List[Dict[str, Any]] = []
+            prepared_segments = checkpoint.get("segments") or checkpoint.get("candidates")
+            final_plan = bool(checkpoint.get("segments"))
+            segments_json: List[Dict[str, Any]] = list(prepared_segments or [])
             transcript_data = load_cached_transcript_data(video_path)
-            for segment in raw_segments:
+            for segment in ([] if prepared_segments else raw_segments):
                 if isinstance(segment, dict):
                     virality = segment.get("virality") or {}
                     if hasattr(virality, "model_dump"):
@@ -1187,9 +1247,10 @@ class VideoService:
                 segments_json.append(segment_payload)
 
             try:
-                segments_json = VideoService._refine_segment_openings(
-                    segments_json, transcript_data, clip_length
-                )
+                if not prepared_segments:
+                    segments_json = VideoService._refine_segment_openings(
+                        segments_json, transcript_data, clip_length
+                    )
             except Exception:
                 # A heuristic must never fail the task; keep the AI's openings.
                 logger.exception("Opening review failed; keeping the selected openings")
@@ -1199,7 +1260,8 @@ class VideoService:
                 clip_limit = min(clip_limit, runtime_config.fast_mode_max_clips)
             # Retain a bounded reserve until picture checks finish, so a rejected
             # slate can be replaced by the next already-ranked candidate.
-            segments_json = segments_json[: min(24, max(1, clip_limit) * 2)]
+            if not prepared_segments:
+                segments_json = segments_json[: min(24, max(1, clip_limit) * 2)]
 
             if not segments_json:
                 logger.warning(
@@ -1214,12 +1276,16 @@ class VideoService:
                     )
                 ]
 
+            if not final_plan:
+                await save_checkpoint({"candidates": segments_json})
+
             if audio_first:
                 audio_path = video_path
                 if progress_callback:
                     await progress_callback(
                         65, "Downloading selected segments...", "processing"
                     )
+                section_error = None
                 try:
                     if source_type in {"twitch", "kick"}:
                         video_path = await run_in_thread(
@@ -1236,19 +1302,26 @@ class VideoService:
                 except DownloadBudgetExceeded as exc:
                     raise Exception(str(exc)) from exc
                 except Exception as exc:
+                    if source_type in {"twitch", "kick"} and isinstance(exc, StreamSourceError):
+                        raise
+                    section_error = exc
+
+                if section_error is not None:
                     logger.warning(
                         "Section download failed, falling back to a full download: %s",
-                        exc,
+                        section_error,
                     )
                     if source_type in {"twitch", "kick"}:
-                        if isinstance(exc, StreamSourceError):
-                            raise
                         video_path = await run_in_thread(
                             download_stream_video, url, file_duration, task_id,
                             max_duration=duration_limit, operation=PROCESSING_OPERATION,
                         )
                     else:
-                        video_path = await VideoService.download_video(url, task_id=task_id, quality=download_quality, budget=job_budget, skip_proxy=not isinstance(exc, PartialDownloadUnavailable))
+                        video_path = await VideoService.download_video(
+                            url, task_id=task_id, quality=download_quality, budget=job_budget,
+                            skip_proxy=not isinstance(section_error, PartialDownloadUnavailable),
+                        )
+                        video_path = preserve_geo_restriction(video_path, section_error)
                     if video_path and audio_path:
                         await run_in_thread(copy_transcript_sidecar, audio_path, video_path)
                         await run_in_thread(persist_cache_sidecar, video_path)
@@ -1262,7 +1335,7 @@ class VideoService:
                 video_path = await VideoService.prepare_source(video_path)
 
             # The picture is only available now when analysis ran on audio.
-            if segments_json:
+            if segments_json and not final_plan:
                 try:
                     segments_json = await run_in_thread(
                         VideoService._drop_static_segments, video_path, segments_json
@@ -1270,9 +1343,12 @@ class VideoService:
                 except Exception:
                     logger.exception("Visual suitability check failed; keeping every segment")
 
-            segments_json = segments_json[:max(1, clip_limit)]
+            if not final_plan:
+                segments_json = segments_json[:max(1, clip_limit)]
             if not segments_json:
                 raise ValueError("No usable footage remains after excluding interruption notices.")
+
+            await save_checkpoint({"segments": segments_json})
 
             return {
                 "segments": segments_json,

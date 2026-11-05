@@ -20,6 +20,7 @@ from ..repositories.minute_usage_repository import charged_duration
 from ..repositories.source_repository import SourceRepository
 from ..repositories.clip_repository import ClipRepository
 from ..repositories.cache_repository import CacheRepository
+from ..repositories.task_checkpoint_repository import TaskCheckpointRepository, checkpoint_input_key
 from .video_service import VideoService
 from .clip_service import ClipEditingMixin
 from ..repositories.edit_transaction import serialized_task_edit, task_edit_transaction, TaskCancelled
@@ -32,6 +33,7 @@ from .task_completion_email_service import (
 )
 from ..config import Config, get_config
 from ..youtube_utils import cleanup_downloaded_files, extract_video_id
+from ..youtube_proxy import YouTubeGeoRestrictedError
 from ..youtube_source import load_time_map, localize_segment, restore_clip_timeline, transcript_source_for
 from ..clip_cleanup import normalize_clip_cleanup_settings
 from ..clip_duration import clip_duration, validate_clip_length
@@ -55,6 +57,7 @@ class TaskService(ClipEditingMixin):
         self.source_repo = SourceRepository()
         self.clip_repo = ClipRepository()
         self.cache_repo = CacheRepository()
+        self.checkpoint_repo = TaskCheckpointRepository()
         self.video_service = VideoService()
         self.config = config or get_config()
         self.reused_upload_task = False
@@ -410,7 +413,16 @@ class TaskService(ClipEditingMixin):
             performance_context = await self._load_performance_context(user_id)
             if performance_context:
                 cached_analysis_json = None
-            cache_hit = bool(cached_transcript and cached_analysis_json)
+            input_key = checkpoint_input_key(url, source_type, processing_mode, clip_length, self.config)
+            checkpoint = await self.checkpoint_repo.get(self.db, task_id, input_key)
+            cache_hit = bool(
+                (checkpoint.get("transcript") or cached_transcript)
+                and (checkpoint.get("analysis") or cached_analysis_json)
+            )
+
+            async def save_checkpoint(patch: Dict[str, Any]) -> None:
+                await self.checkpoint_repo.save(self.db, task_id, input_key, patch)
+                checkpoint.update(patch)
 
             await self.task_repo.update_task_runtime_metadata(
                 self.db,
@@ -474,6 +486,8 @@ class TaskService(ClipEditingMixin):
                 should_cancel=should_cancel,
                 performance_context=performance_context,
                 clip_length=clip_length,
+                checkpoint=checkpoint,
+                checkpoint_callback=save_checkpoint,
             )
             stage_timings["pipeline_seconds"] = round(
                 perf_counter() - pipeline_start, 3
@@ -528,14 +542,23 @@ class TaskService(ClipEditingMixin):
             clips_output_dir = Path(self.config.temp_dir) / "clips"
             clips_output_dir.mkdir(parents=True, exist_ok=True)
 
-            # Retries and regenerations should replace earlier clip rows instead of
-            # accumulating duplicates for the same task.
+            # Completed positions survive retries, including edits, exports and
+            # scheduled posts attached to their IDs. Never delete usable output
+            # before a later render has even succeeded.
             async with self._processing_transaction(task_id):
                 await check_cancelled()
-                await self.clip_repo.delete_clips_by_task(self.db, task_id)
-                await self.task_repo.update_task_clips(self.db, task_id, [])
+                existing_clips = await self.clip_repo.get_clips_by_task(self.db, task_id)
+                clip_ids_by_order = {clip["clip_order"]: clip["id"] for clip in existing_clips}
+                # Display order changes when a user splits, merges or reorders
+                # clips. Track completed plan positions separately and commit
+                # them atomically with each newly created clip.
+                completed_positions = set(checkpoint.get("completed_positions", clip_ids_by_order))
+                await save_checkpoint({"completed_positions": sorted(completed_positions)})
+                await self.task_repo.update_task_clips(
+                    self.db, task_id, [clip_ids_by_order[order] for order in sorted(clip_ids_by_order)]
+                )
 
-            clip_ids = []
+            failed_positions = []
             render_start = perf_counter()
             # Read from the task so queued jobs and resumes honour the setting.
             task_row = await self.task_repo.get_task_by_id(self.db, task_id) or {}
@@ -545,6 +568,8 @@ class TaskService(ClipEditingMixin):
             for i, segment in enumerate(segments_to_render):
                 # Check cancellation
                 await check_cancelled()
+                if i + 1 in completed_positions:
+                    continue
 
                 # Update progress: 70-95% spread across clips
                 clip_progress = 70 + int(
@@ -578,7 +603,8 @@ class TaskService(ClipEditingMixin):
                 pending_clip_path = Path(clip_info["path"]) if clip_info else None
                 await check_cancelled()
                 if clip_info is None:
-                    continue  # Skip failed clip
+                    failed_positions.append(i + 1)
+                    continue
                 if time_map:
                     clip_info = await run_in_thread(
                         restore_clip_timeline, clip_info, time_map, segment
@@ -586,6 +612,7 @@ class TaskService(ClipEditingMixin):
 
                 async with self._processing_transaction(task_id):
                     await check_cancelled()
+                    clip_order = max(clip_ids_by_order, default=0) + 1
                     # Save to DB immediately
                     clip_id = await self.clip_repo.create_clip(
                         self.db,
@@ -598,7 +625,7 @@ class TaskService(ClipEditingMixin):
                         text=clip_info.get("text", ""),
                         relevance_score=clip_info.get("relevance_score", 0.0),
                         reasoning=clip_info.get("reasoning", ""),
-                        clip_order=i + 1,
+                        clip_order=clip_order,
                         virality_score=clip_info.get("virality_score", 0),
                         hook_score=clip_info.get("hook_score", 0),
                         engagement_score=clip_info.get("engagement_score", 0),
@@ -609,11 +636,16 @@ class TaskService(ClipEditingMixin):
                     )
 
                     # Update task's clip IDs array
-                    await self.task_repo.update_task_clips(self.db, task_id, [*clip_ids, clip_id])
+                    next_clip_ids = {**clip_ids_by_order, clip_order: clip_id}
+                    await self.task_repo.update_task_clips(
+                        self.db, task_id, [next_clip_ids[order] for order in sorted(next_clip_ids)]
+                    )
+                    await save_checkpoint({"completed_positions": sorted(completed_positions | {i + 1})})
 
                     await check_cancelled()
                 pending_clip_path = None
-                clip_ids.append(clip_id)
+                clip_ids_by_order[clip_order] = clip_id
+                completed_positions.add(i + 1)
 
                 # Notify frontend via SSE
                 if clip_ready_callback:
@@ -627,8 +659,14 @@ class TaskService(ClipEditingMixin):
                 perf_counter() - render_start, 3
             )
 
+            clip_ids = [clip_ids_by_order[order] for order in sorted(clip_ids_by_order)]
             if not clip_ids:
                 raise ValueError("No clips could be rendered. Please try again.")
+            if failed_positions:
+                raise ValueError(
+                    f"Could not render {len(failed_positions)} clips. Your completed clips are saved. "
+                    "Retry generation to create the missing clips."
+                )
 
             # A cancellation committed after the final render must win over completion.
             await check_cancelled()
@@ -699,7 +737,9 @@ class TaskService(ClipEditingMixin):
                 raise
             error_code = "task_error"
             message = str(e).lower()
-            if "download" in message or "youtube" in message:
+            if isinstance(e, YouTubeGeoRestrictedError):
+                error_code = "youtube_geo_restricted"
+            elif "download" in message or "youtube" in message:
                 error_code = "download_error"
             elif "analysis" in message:
                 error_code = "analysis_error"
@@ -803,7 +843,7 @@ class TaskService(ClipEditingMixin):
                 "error",
                 progress=0,
                 progress_message=(
-                    "The queued job is no longer available. Please resume this generation."
+                    "The queued job is no longer available. Please retry this generation."
                 ),
                 expected_statuses=["queued"],
             )
